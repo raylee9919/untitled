@@ -1,15 +1,12 @@
 // Copyright Seong Woo Lee. All Rights Reserved.
 
 main :: () {
-    print("Hello, Sailor!\n");
+    device: RHI_Device;
+    if !init_device(*device) {
+        debug_break();
+    }
 }
 
 
 #import "Basic";
-
-#if OS == .WINDOWS {
-    #import "Windows";
-    #import "dxgi";
-    #import "d3d12"()(INCLUDE_DEBUG_BINDINGS = __DEBUG);
-    #load "RHI/d3d12.jai";
-}
+#load "rhi.jai";

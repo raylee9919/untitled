@@ -54,8 +54,8 @@ build :: () {
 
     set_build_options(options, w);
 
-    if build_debug  add_build_string("__DEBUG :: true;", w);
-    else            add_build_string("__DEBUG :: false;", w);
+    if build_debug  add_build_string("DEBUG :: true;", w);
+    else            add_build_string("DEBUG :: false;", w);
     
     add_build_file("source/main.jai", w);
 
