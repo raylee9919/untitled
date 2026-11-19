@@ -5,16 +5,19 @@
 #import "File";
 
 EXECUTABLE_NAME :: "untitled";
+BUILD_PATH      :: "build";
 
 #run,stallable build();
 
 build :: () {
 
+    set_working_directory(#filepath);
+
     options := get_build_options();
     args := options.compile_time_command_line;
 
-    if !make_directory_if_it_does_not_exist("build") {
-        log_error("Failed to create directory: 'build'.\n");
+    if !make_directory_if_it_does_not_exist(BUILD_PATH) {
+        print("Failed to create directory: '%'.\n", BUILD_PATH);
         return;
     }
 
@@ -30,27 +33,29 @@ build :: () {
                 build_debug = false;
 
             case;
-                compiler_report(tprint("Command-line argument #%, '%' is invalid.", it_index + 1, arg));
+                print("Command-line argument #%, '%' is invalid.\n", it_index + 1, arg);
+                return;
         }
     }
 
     if build_debug {
+        print("Debug build\n");
         set_optimization(*options, .DEBUG);
         options.backend           = .X64;
-        options.output_path       = "build/debug";
-        options.intermediate_path = "build/debug/intermediate";
-        print("Debug build\n");
+        options.output_path       = tprint("%/debug", BUILD_PATH);
+        options.intermediate_path = tprint("%/debug/intermediate", BUILD_PATH);
     } else {
+        print("Release build\n");
         set_optimization(*options, .OPTIMIZED);
         options.backend           = .LLVM;
-        options.output_path       = "build/release";
-        options.intermediate_path = "build/release/intermediate";
-        print("Release build\n");
+        options.output_path       = tprint("%/release", BUILD_PATH);
+        options.intermediate_path = tprint("%/release/intermediate", BUILD_PATH);
     }
 
-    set_working_directory(#filepath);
-
     set_build_options(options, w);
+
+    if build_debug  add_build_string("__DEBUG :: true;", w);
+    else            add_build_string("__DEBUG :: false;", w);
     
     add_build_file("source/main.jai", w);
 
