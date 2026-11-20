@@ -19,8 +19,6 @@
         device_0:               *ID3D12Device;
         device_10:              *ID3D12Device10;
 
-        global_root_signature:  *ID3D12RootSignature;
-
         #if DEBUG {
             info_queue_0:           *ID3D12InfoQueue;
             info_queue_1:           *ID3D12InfoQueue1;
@@ -29,7 +27,47 @@
             dxgi_debug_dll:          HMODULE;
             dxgi_debug:             *IDXGIDebug;
         }
-    };
+
+        graphics_queue: Command_Queue;
+        compute\_queue: Command_Queue;
+        transfer_queue: Command_Queue;
+
+        rtv\    _heap: Descriptor_Heap;
+        dsv\    _heap: Descriptor_Heap;
+        resource_heap: Descriptor_Heap;
+        sampler\_heap: Descriptor_Heap;
+
+        global_root_signature: *ID3D12RootSignature;
+    }
+
+
+    Command_Type :: enum {
+        GRAPHICS;
+        COMPUTE;
+        TRANSFER;
+    }
+
+    Command_Queue :: struct {
+        type:     D3D12_COMMAND_LIST_TYPE;
+        queue_0: *ID3D12CommandQueue;
+    }
+
+    Command_Buffer :: struct {
+        type:          D3D12_COMMAND_LIST_TYPE;
+        list_0:       *ID3D12GraphicsCommandList;
+        list_7:       *ID3D12GraphicsCommandList7;
+        allocator:    *ID3D12CommandAllocator;
+        is_recording:  bool;
+    }
+
+
+    Memory_Type :: enum {
+        GPU_ONLY :: 0;
+        UPLOAD   :: 1;
+        READBACK :: 2;
+    }
+
+
 
 
     init_device :: (device: *RHI_Device) -> bool {
@@ -206,6 +244,19 @@
         adapter_1 = null;
 
 
+        // Initialize command queues.
+        ok := true;
+        ok &&= init_command_queue(device, *device.graphics_queue, d3d12_command_type_from_rhi(Command_Type.GRAPHICS));
+        ok &&= init_command_queue(device, *device.compute\_queue, d3d12_command_type_from_rhi(Command_Type.COMPUTE));
+        ok &&= init_command_queue(device, *device.transfer_queue, d3d12_command_type_from_rhi(Command_Type.TRANSFER));
+        if !ok {
+            return false;
+        }
+
+
+        // Initialize descriptor heaps.
+
+
         return true;
     }
 
@@ -241,6 +292,16 @@
 
     #scope_file
 
+    Descriptor_Heap :: struct {
+        type:    D3D12_DESCRIPTOR_HEAP_TYPE;
+        heap_0: *ID3D12DescriptorHeap;
+
+        base_cpu_handle: D3D12_CPU_DESCRIPTOR_HANDLE;
+        base_gpu_handle: D3D12_GPU_DESCRIPTOR_HANDLE;
+
+        descriptor_size: u32;
+    }
+
     d3d12_log :: (severity: D3D12_MESSAGE_SEVERITY, description: *u8) #no_context {
         strlen :: (s: *u8) -> s64 #no_context {
             count: s64 = 0;
@@ -272,5 +333,40 @@
             case .MESSAGE;
                 if description  d3d12_log(severity, description);
         }
+    }
+
+    d3d12_command_type_from_rhi :: (type: Command_Type) -> D3D12_COMMAND_LIST_TYPE {
+        if #complete type == {
+            case .GRAPHICS;
+                return .D3D12_COMMAND_LIST_TYPE_DIRECT;
+
+            case .COMPUTE;
+                return .D3D12_COMMAND_LIST_TYPE_COMPUTE;
+
+            case .TRANSFER;
+                return .D3D12_COMMAND_LIST_TYPE_COPY;
+        }
+    }
+
+    init_command_queue :: (device: *RHI_Device, queue: *Command_Queue, type: D3D12_COMMAND_LIST_TYPE) -> bool {
+        desc: D3D12_COMMAND_QUEUE_DESC = .{
+            Type     = type,
+            Priority = xx D3D12_COMMAND_QUEUE_PRIORITY.NORMAL,
+        };
+
+        hr := ID3D12Device_CreateCommandQueue(device.device_0, *desc, *uid(ID3D12CommandQueue_UUID), xx *queue.queue_0);
+        if FAILED(hr) {
+            log_error("Failed to create command queue.");
+            return false;
+        }
+
+        queue.type = type;
+
+        return true;
+    }
+
+    deinit_command_queue :: (using queue: *Command_Queue) {
+        IUnknown_Release(xx queue_0);
+        queue_0 = null;
     }
 }
