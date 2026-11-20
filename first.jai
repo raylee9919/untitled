@@ -34,14 +34,14 @@ build :: () {
         print("Debug build\n");
         set_optimization(*options, .DEBUG);
         options.backend           = .X64;
-        options.output_path       = path_join(BUILD_PATH, "debug");
-        options.intermediate_path = path_join(options.output_path, "intermediate");
+        options.output_path       = path_join(BUILD_PATH, "debug", separator = "/");
+        options.intermediate_path = path_join(options.output_path, "intermediate", separator = "/");
     } else {
         print("Release build\n");
         set_optimization(*options, .OPTIMIZED);
         options.backend           = .LLVM;
-        options.output_path       = path_join(BUILD_PATH, "release");
-        options.intermediate_path = path_join(options.output_path, "intermediate");
+        options.output_path       = path_join(BUILD_PATH, "release", separator = "/");
+        options.intermediate_path = path_join(options.output_path, "intermediate", separator = "/");
     }
 
 
@@ -58,7 +58,7 @@ build :: () {
     libs := file_list(LIB_PATH);
     for src: libs {
         name := path_filename(src);
-        dst := path_join(options.output_path, name);
+        dst := path_join(options.output_path, name, separator = "/");
 
         if !file_exists(dst) {
             if !copy_file(src, dst, true) {

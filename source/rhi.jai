@@ -9,6 +9,7 @@
     #import     "d3d_compiler";
 
 
+    // @Todo: Check if it works as expected.
     #program_export D3D12SDKVersion: u32 = 619;
     #program_export D3D12SDKPath:   *u8  = ".\\.";
 

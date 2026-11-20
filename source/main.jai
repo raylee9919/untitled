@@ -5,6 +5,12 @@ main :: () {
     if !init_device(*device) {
         debug_break();
     }
+
+    foo(,, allocator=temp);
+}
+
+foo :: () { 
+    print("Hello\n");
 }
 
 
