@@ -6,6 +6,7 @@
     #import     "Windows_Utf8";
     #import,dir "DXGI";
     #import     "d3d12"()(INCLUDE_DEBUG_BINDINGS = DEBUG);
+    #import     "d3d_compiler";
 
 
     #program_export D3D12SDKVersion: u32 = 619;
@@ -15,17 +16,17 @@
     #scope_module
 
     RHI_Device :: struct {
-        factory_6:              *IDXGIFactory6;
-        device_0:               *ID3D12Device;
-        device_10:              *ID3D12Device10;
+        factory_6: *IDXGIFactory6;
+        device_0:  *ID3D12Device;
+        device_10: *ID3D12Device10;
 
         #if DEBUG {
-            info_queue_0:           *ID3D12InfoQueue;
-            info_queue_1:           *ID3D12InfoQueue1;
-            callback_cookie:         DWORD;
+            info_queue_0:    *ID3D12InfoQueue;
+            info_queue_1:    *ID3D12InfoQueue1;
+            callback_cookie:  DWORD;
 
-            dxgi_debug_dll:          HMODULE;
-            dxgi_debug:             *IDXGIDebug;
+            dxgi_debug_dll:   HMODULE;
+            dxgi_debug:      *IDXGIDebug;
         }
 
         graphics_queue: Command_Queue;
@@ -212,6 +213,7 @@
 
 
         {
+            // Check for enhanced barrier feature.
             options_12: D3D12_FEATURE_DATA_D3D12_OPTIONS12;
             hr = ID3D12Device_CheckFeatureSupport(device_0, .D3D12_FEATURE_D3D12_OPTIONS12, *options_12, size_of(D3D12_FEATURE_DATA_D3D12_OPTIONS12));
 
@@ -235,27 +237,58 @@
         }
 
 
+        // Set fields.
         device.factory_6  = factory_6;
         device.device_0   = device_0;
         device.device_10  = device_10;
 
 
-        IUnknown_Release(adapter_1);
-        adapter_1 = null;
-
-
         // Initialize command queues.
         ok := true;
-        ok &&= init_command_queue(device, *device.graphics_queue, d3d12_command_type_from_rhi(Command_Type.GRAPHICS));
-        ok &&= init_command_queue(device, *device.compute\_queue, d3d12_command_type_from_rhi(Command_Type.COMPUTE));
-        ok &&= init_command_queue(device, *device.transfer_queue, d3d12_command_type_from_rhi(Command_Type.TRANSFER));
+        ok &&= init_command_queue(device, *device.graphics_queue, d3d12_command_type_from_rhi(.GRAPHICS));
+        ok &&= init_command_queue(device, *device.compute\_queue, d3d12_command_type_from_rhi(.COMPUTE));
+        ok &&= init_command_queue(device, *device.transfer_queue, d3d12_command_type_from_rhi(.TRANSFER));
         if !ok {
             return false;
         }
 
 
+        // @Todo
         // Initialize descriptor heaps.
 
+
+        // Create bindless global root signature.
+        root_params: [2] D3D12_ROOT_PARAMETER = .[
+            .{ ParameterType = ._32BIT_CONSTANTS, Constants = .{ ShaderRegister = 0, RegisterSpace = 0, Num32BitValues = MAX_32BIT_PUSH_CONSTANTS } },  // b0
+            .{ ParameterType = ._32BIT_CONSTANTS, Constants = .{ ShaderRegister = 1, RegisterSpace = 0, Num32BitValues = MAX_32BIT_PUSH_CONSTANTS } },  // b1
+        ];
+
+        root_signature_desc: D3D12_ROOT_SIGNATURE_DESC = .{
+            NumParameters     = root_params.count,
+            pParameters       = root_params.data,
+            NumStaticSamplers = 0,
+            pStaticSamplers   = null,
+            Flags             = .ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | .CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | .SAMPLER_HEAP_DIRECTLY_INDEXED
+        };
+
+        signature_blob: *ID3DBlob;
+        error\   _blob: *ID3DBlob;
+
+        hr = D3D12SerializeRootSignature(*root_signature_desc, .D3D_ROOT_SIGNATURE_VERSION_1, *signature_blob, *error_blob);
+        if hr != S_OK {
+            log_error("D3D12SerializeRootSignature() failed.");
+            return false;
+        }
+
+        hr = ID3D12Device_CreateRootSignature(device_0, 0, ID3D10Blob_GetBufferPointer(signature_blob), ID3D10Blob_GetBufferSize(signature_blob), *uid(ID3D12RootSignature_UUID), xx *device.global_root_signature);
+        if hr != S_OK {
+            log_error("ID3D12Device_CreateRootSignature() failed.");
+            return false;
+        }
+
+        safe_release(*signature_blob);
+        safe_release(*error\   _blob);
+        safe_release(*adapter_1);
 
         return true;
     }
@@ -277,20 +310,18 @@
             dxgi_debug_dll = null;
         }
 
-        IUnknown_Release(device_10);
-        device_10 = null;
-
-        IUnknown_Release(device_0);
-        device_0 = null;
-
-        IUnknown_Release(factory_6);
-        factory_6 = null;
+        safe_release(*device_10);
+        safe_release(*device_0);
+        safe_release(*factory_6);
     }
 
 
 
 
     #scope_file
+
+
+    MAX_32BIT_PUSH_CONSTANTS :: 32;
 
     Descriptor_Heap :: struct {
         type:    D3D12_DESCRIPTOR_HEAP_TYPE;
@@ -300,6 +331,14 @@
         base_gpu_handle: D3D12_GPU_DESCRIPTOR_HANDLE;
 
         descriptor_size: u32;
+    }
+
+    safe_release :: (pptr: $T) {
+        // @Robustness: my gut tells me I could check if it is a pointer or double pointer in Jai.
+        if (pptr && pptr.*) {
+            IUnknown_Release(pptr.*);
+            pptr.* = null;
+        }
     }
 
     d3d12_log :: (severity: D3D12_MESSAGE_SEVERITY, description: *u8) #no_context {
@@ -337,14 +376,9 @@
 
     d3d12_command_type_from_rhi :: (type: Command_Type) -> D3D12_COMMAND_LIST_TYPE {
         if #complete type == {
-            case .GRAPHICS;
-                return .D3D12_COMMAND_LIST_TYPE_DIRECT;
-
-            case .COMPUTE;
-                return .D3D12_COMMAND_LIST_TYPE_COMPUTE;
-
-            case .TRANSFER;
-                return .D3D12_COMMAND_LIST_TYPE_COPY;
+            case .GRAPHICS;  return .DIRECT;
+            case .COMPUTE;   return .COMPUTE;
+            case .TRANSFER;  return .COPY;
         }
     }
 
