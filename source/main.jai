@@ -2,17 +2,13 @@
 
 main :: () {
     device: RHI_Device;
-    if !init_device(*device) {
+    if !init_device(*device, temp) {
         debug_break();
     }
-
-    foo(,, allocator=temp);
 }
-
-foo :: () { 
-    print("Hello\n");
-}
-
 
 #import "Basic";
+#import "Window_Creation";
+#import "Input";
+#import "Bit_Operations";
 #load "rhi.jai";

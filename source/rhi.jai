@@ -21,6 +21,8 @@
         device_0:  *ID3D12Device;
         device_10: *ID3D12Device10;
 
+        allocator: Allocator;
+
         #if DEBUG {
             info_queue_0:    *ID3D12InfoQueue;
             info_queue_1:    *ID3D12InfoQueue1;
@@ -42,7 +44,6 @@
         global_root_signature: *ID3D12RootSignature;
     }
 
-
     Command_Type :: enum {
         GRAPHICS;
         COMPUTE;
@@ -62,18 +63,43 @@
         is_recording:  bool;
     }
 
-
     Memory_Type :: enum {
         GPU_ONLY :: 0;
         UPLOAD   :: 1;
         READBACK :: 2;
     }
 
+    Descriptor_Heap :: struct {
+        type: D3D12_DESCRIPTOR_HEAP_TYPE;
+
+        allocator: Allocator;
+
+        heap_0: *ID3D12DescriptorHeap;
+
+        base_cpu_handle: D3D12_CPU_DESCRIPTOR_HANDLE;
+        base_gpu_handle: D3D12_GPU_DESCRIPTOR_HANDLE; // valid if visible on GPU.
+
+        descriptor_size: s64;
+
+        free_list: *s64;
+        node_count: int;
+        allocated:  int; // number of every slots.
+        count:      int; // number of active descriptors.
+    }
+
+    Descriptor :: struct {
+        type:        D3D12_DESCRIPTOR_HEAP_TYPE;
+        index:       int;
+        heap:       *Descriptor_Heap;
+        cpu_handle:  D3D12_CPU_DESCRIPTOR_HANDLE;
+        gpu_handle:  D3D12_GPU_DESCRIPTOR_HANDLE;
+    }
 
 
-
-    init_device :: (device: *RHI_Device) -> bool {
+    init_device :: (device: *RHI_Device, allocator: Allocator) -> bool {
         hr: HRESULT;
+
+        remember_allocators(device,, allocator);
 
         #if DEBUG {
             debug_0: *ID3D12Debug;
@@ -249,13 +275,15 @@
         ok &&= init_command_queue(device, *device.graphics_queue, d3d12_command_type_from_rhi(.GRAPHICS));
         ok &&= init_command_queue(device, *device.compute\_queue, d3d12_command_type_from_rhi(.COMPUTE));
         ok &&= init_command_queue(device, *device.transfer_queue, d3d12_command_type_from_rhi(.TRANSFER));
-        if !ok {
-            return false;
-        }
+        if !ok  return false;
 
 
-        // @Todo
         // Initialize descriptor heaps.
+        ok = init_descriptor_heap(device, *device.rtv_heap,      .RTV,          256);
+        ok = init_descriptor_heap(device, *device.dsv_heap,      .DSV,           32);
+        ok = init_descriptor_heap(device, *device.resource_heap, .CBV_SRV_UAV, 2048);
+        ok = init_descriptor_heap(device, *device.sampler_heap,  .SAMPLER,       16);
+        if !ok  return false;
 
 
         // Create bindless global root signature.
@@ -311,9 +339,66 @@
             dxgi_debug_dll = null;
         }
 
+        deinit_descriptor_heap(*device.rtv_heap);
+        deinit_descriptor_heap(*device.dsv_heap);
+        deinit_descriptor_heap(*device.resource_heap);
+        deinit_descriptor_heap(*device.sampler_heap);
+
         safe_release(*device_10);
         safe_release(*device_0);
         safe_release(*factory_6);
+    }
+
+    alloc_descriptor :: (using heap: *Descriptor_Heap) -> Descriptor {
+        i1 := -1;
+        i2 := -1;
+
+        for 0..node_count-1 {
+            bits := free_list[it];
+            i2 = bit_scan_forward(bits) - 1;
+            if i2 >= 0 {
+                i1 = it;
+                bits ^= (1 << i2);
+                free_list[it] = bits;
+                break;
+            }
+        }
+
+        if i1 < 0 {
+            assert(i2 == -1);
+            assert(false, "Descriptor heap out of space."); // @Robustness: Resize
+        }
+
+        count += 1;
+
+        index  := i1*64 + i2;
+        offset := heap.descriptor_size * index;
+
+        result: Descriptor = .{
+            type       = heap.type,
+            index      = index,
+            heap       = heap,
+            cpu_handle = .{ heap.base_cpu_handle.ptr + xx offset },
+        };
+
+        if is_shader_visible(type) {
+            result.gpu_handle.ptr = heap.base_gpu_handle.ptr + xx offset;
+        }
+
+        return result;
+    }
+
+    dealloc_descriptor :: (using d: *Descriptor) {
+        assert(heap.count > 0);
+        heap.count -= 1;
+
+        i1 := index / 64;
+        i2 := index % 64;
+
+        cleared := ((heap.free_list[i1] & (1 << i2)) == 0);
+        assert(cleared);
+
+        heap.free_list[i1] |= (1 << i2);
     }
 
 
@@ -324,15 +409,6 @@
 
     MAX_32BIT_PUSH_CONSTANTS :: 32;
 
-    Descriptor_Heap :: struct {
-        type:    D3D12_DESCRIPTOR_HEAP_TYPE;
-        heap_0: *ID3D12DescriptorHeap;
-
-        base_cpu_handle: D3D12_CPU_DESCRIPTOR_HANDLE;
-        base_gpu_handle: D3D12_GPU_DESCRIPTOR_HANDLE;
-
-        descriptor_size: u32;
-    }
 
     safe_release :: (pptr: $T) {
         // @Robustness: my gut tells me I could check if it is a pointer or double pointer in Jai.
@@ -403,5 +479,56 @@
     deinit_command_queue :: (using queue: *Command_Queue) {
         IUnknown_Release(xx queue_0);
         queue_0 = null;
+    }
+
+    is_shader_visible :: (type: D3D12_DESCRIPTOR_HEAP_TYPE) -> bool {
+        return type == .CBV_SRV_UAV || type == .SAMPLER;
+    }
+
+    init_descriptor_heap :: (device: *RHI_Device, 
+                             heap:   *Descriptor_Heap,
+                             type:    D3D12_DESCRIPTOR_HEAP_TYPE, 
+                             count:   int) -> bool {
+        heap.type = type;
+
+        remember_allocators(heap,, device.allocator);
+
+        flags: D3D12_DESCRIPTOR_HEAP_FLAGS = .NONE;
+
+        if is_shader_visible(type)  flags = .SHADER_VISIBLE;
+
+        heap.allocated = align_forward(count, 64);
+
+        heap_desc : D3D12_DESCRIPTOR_HEAP_DESC = .{
+            Type           = type,
+            NumDescriptors = cast(u32) heap.allocated,
+            Flags          = flags,
+        };
+
+        hr := ID3D12Device_CreateDescriptorHeap(device.device_0, *heap_desc, *uid(ID3D12DescriptorHeap_UUID), xx *heap.heap_0);
+        if FAILED(hr) {
+            log_error("ID3D12Device_CreateDescriptorHeap failed.");
+            return false;
+        }
+
+        // Get base CPU and GPU handle.
+        heap.base_cpu_handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(heap.heap_0);
+        if flags & .SHADER_VISIBLE {
+            heap.base_gpu_handle = ID3D12DescriptorHeap_GetGPUDescriptorHandleForHeapStart(heap.heap_0);
+        }
+
+        // Get descriptor size.
+        heap.descriptor_size = ID3D12Device_GetDescriptorHandleIncrementSize(device.device_0, type);
+
+
+        // Make a free list
+        heap.node_count = heap.allocated / 64;
+        heap.free_list = alloc(size_of(u64) * heap.node_count);
+
+        return true;
+    }
+
+    deinit_descriptor_heap :: (heap: *Descriptor_Heap) {
+        safe_release(heap.heap_0);
     }
 }
