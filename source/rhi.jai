@@ -2,12 +2,8 @@
 
 #if OS == .WINDOWS {
 
-    #import     "Windows";
-    #import     "Windows_Utf8";
-    #import,dir "DXGI";
     #import     "d3d12"()(INCLUDE_DEBUG_BINDINGS = DEBUG);
     #import     "d3d_compiler";
-
 
     // @Todo: Check if it works as expected.
     #program_export D3D12SDKVersion: u32 = 619;
@@ -16,7 +12,7 @@
 
     #scope_module
 
-    RHI_Device :: struct {
+    Device :: struct {
         factory_6: *IDXGIFactory6;
         device_0:  *ID3D12Device;
         device_10: *ID3D12Device10;
@@ -55,12 +51,13 @@
         queue_0: *ID3D12CommandQueue;
     }
 
-    Command_Buffer :: struct {
-        type:          D3D12_COMMAND_LIST_TYPE;
+    Command_Encoder :: struct {
+        type:          Command_Type;
+        device:       *Device;
+        allocator:    *ID3D12CommandAllocator;
         list_0:       *ID3D12GraphicsCommandList;
         list_7:       *ID3D12GraphicsCommandList7;
-        allocator:    *ID3D12CommandAllocator;
-        is_recording:  bool;
+        is_encoding:   bool;
     }
 
     Memory_Type :: enum {
@@ -95,8 +92,13 @@
         gpu_handle:  D3D12_GPU_DESCRIPTOR_HANDLE;
     }
 
+    Semaphore :: struct {
+        fence: *ID3D12Fence;
+        event:  HANDLE;
+    }
 
-    init_device :: (device: *RHI_Device, allocator: Allocator) -> bool {
+
+    init_device :: (device: *Device, allocator: Allocator) -> bool {
         hr: HRESULT;
 
         remember_allocators(device,, allocator);
@@ -217,10 +219,10 @@
 
         {
             /*
-              Bindless rendering requires Shader Model 6.6 and Resource Binding Tier 3. 
-              According to the d3d12 info db, all hardware since 2016, except two Qualcomm GPUs supports these features. 
-              (https://d3d12infodb.boolka.dev/)
-              (https://github.com/microsoft/DirectX-Specs/blob/master/d3d/HLSL_SM_6_6_DynamicResources.md)
+            Bindless rendering requires Shader Model 6.6 and Resource Binding Tier 3. 
+            According to the d3d12 info db, all hardware since 2016, except two Qualcomm GPUs supports these features. 
+            (https://d3d12infodb.boolka.dev/)
+            (https://github.com/microsoft/DirectX-Specs/blob/master/d3d/HLSL_SM_6_6_DynamicResources.md)
             */
             sm: D3D12_FEATURE_DATA_SHADER_MODEL;
             sm.HighestShaderModel = .D3D_SHADER_MODEL_6_6;
@@ -322,7 +324,7 @@
         return true;
     }
 
-    deinit_device :: (using device: *RHI_Device) {
+    deinit_device :: (using device: *Device) {
         #if DEBUG {
             IUnknown_Release(info_queue_1);
             info_queue_1 = null;
@@ -401,6 +403,105 @@
         heap.free_list[i1] |= (1 << i2);
     }
 
+    init_encoder :: (device:  *Device,
+                     encoder: *Command_Encoder, 
+                     type:     Command_Type) -> bool {
+        encoder.type = type;
+        encoder.device = device;
+
+        native_type := to_d3d12_command_type(type);
+
+        hr := ID3D12Device_CreateCommandAllocator(device.device_0, native_type, *uid(ID3D12CommandAllocator_UUID), xx *encoder.allocator);
+        if FAILED(hr) {
+            log_error("ID3D12Device_CreateCommandAllocator failed.");
+            return false;
+        }
+
+        hr = ID3D12Device4_CreateCommandList1(device.device_10, 0, native_type, .D3D12_COMMAND_LIST_FLAG_NONE, *uid(ID3D12GraphicsCommandList_UUID), xx *encoder.list_0);
+        if FAILED(hr) {
+            log_error("ID3D12Device4_CreateCommandList failed.");
+            return false;
+        }
+
+        hr = IUnknown_QueryInterface(encoder.list_0, *uid(ID3D12GraphicsCommandList7_UUID), xx *encoder.list_7);
+        if FAILED(hr) {
+            log_error("Failed to query 'ID3D12GraphicsCommandList7'.");
+            return false;
+        }
+
+        return true;
+    }
+
+    deinit_encoder :: (using encoder: *Command_Encoder) {
+        if encoder {
+            safe_release(*list_7);
+            safe_release(*list_0);
+            safe_release(*allocator);
+        }
+    }
+
+    begin :: (using encoder: *Command_Encoder) {
+        assert(!is_encoding);
+        is_encoding = true;
+        ID3D12GraphicsCommandList_Reset(list_7, allocator, null);
+
+        // [0]: resource, [1]: sampler
+        heaps: [2] *ID3D12DescriptorHeap = .[ device.resource_heap.heap_0, device.sampler_heap.heap_0 ];
+        ID3D12GraphicsCommandList_SetDescriptorHeaps(list_7, heaps.count, heaps.data);
+    }
+
+    end :: (using encoder: *Command_Encoder) {
+        assert(is_encoding);
+        is_encoding = false;
+        ID3D12GraphicsCommandList_Close(list_7);
+    }
+
+    submit :: (using encoder: *Command_Encoder) {
+        if #complete type == {
+            case .GRAPHICS;
+                ID3D12CommandQueue_ExecuteCommandLists(device. graphics_queue.queue_0, 1, cast(**ID3D12CommandList) *list_7);
+            case .COMPUTE;
+                ID3D12CommandQueue_ExecuteCommandLists(device. compute\_queue.queue_0, 1, cast(**ID3D12CommandList) *list_7);
+            case .TRANSFER;
+                ID3D12CommandQueue_ExecuteCommandLists(device. transfer_queue.queue_0, 1, cast(**ID3D12CommandList) *list_7);
+        }
+    }
+
+
+    init_semaphore :: (device: *Device, using s: *Semaphore) -> bool {
+        init: u64 = 0;
+        flags := D3D12_FENCE_FLAGS.NONE;
+
+        hr := ID3D12Device_CreateFence(device.device_0, init, flags, *uid(ID3D12Fence_UUID), xx *fence);
+        if FAILED(hr) {
+            log_error("ID3D12Device_CreateFence failed.");
+            return false;
+        }
+
+        event = CreateEventW(null, 0, 0, null);
+        return true;
+    }
+
+    deinit_semaphore :: (using s: *Semaphore) {
+        safe_release(*fence);
+        if event {
+            CloseHandle(event);
+            event = null;
+        }
+    }
+
+    wait :: (using s: *Semaphore, value: u64, milliseconds: s32) {
+        timeout: u32 = ifx milliseconds == -1 then INFINITE else cast(u32) milliseconds;
+        if get_completed_value(s) < value {
+            ID3D12Fence_SetEventOnCompletion(fence, value, event);
+            WaitForSingleObject(event, timeout);
+        }
+    }
+
+    get_completed_value :: (using s: *Semaphore) -> u64 {
+        return ID3D12Fence_GetCompletedValue(fence);
+    }
+
 
 
 
@@ -415,6 +516,14 @@
         if (pptr && pptr.*) {
             IUnknown_Release(pptr.*);
             pptr.* = null;
+        }
+    }
+
+    to_d3d12_command_type :: (type: Command_Type) -> D3D12_COMMAND_LIST_TYPE {
+        if #complete type == {
+            case .GRAPHICS;  return .DIRECT;
+            case .COMPUTE;   return .COMPUTE;
+            case .TRANSFER;  return .COPY;
         }
     }
 
@@ -459,7 +568,7 @@
         }
     }
 
-    init_command_queue :: (device: *RHI_Device, queue: *Command_Queue, type: D3D12_COMMAND_LIST_TYPE) -> bool {
+    init_command_queue :: (device: *Device, queue: *Command_Queue, type: D3D12_COMMAND_LIST_TYPE) -> bool {
         desc: D3D12_COMMAND_QUEUE_DESC = .{
             Type     = type,
             Priority = xx D3D12_COMMAND_QUEUE_PRIORITY.NORMAL,
@@ -485,7 +594,7 @@
         return type == .CBV_SRV_UAV || type == .SAMPLER;
     }
 
-    init_descriptor_heap :: (device: *RHI_Device, 
+    init_descriptor_heap :: (device: *Device, 
                              heap:   *Descriptor_Heap,
                              type:    D3D12_DESCRIPTOR_HEAP_TYPE, 
                              count:   int) -> bool {
@@ -529,6 +638,6 @@
     }
 
     deinit_descriptor_heap :: (heap: *Descriptor_Heap) {
-        safe_release(heap.heap_0);
+        safe_release(*heap.heap_0);
     }
 }
