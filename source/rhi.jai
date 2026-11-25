@@ -92,9 +92,59 @@
         gpu_handle:  D3D12_GPU_DESCRIPTOR_HANDLE;
     }
 
+
     Semaphore :: struct {
         fence: *ID3D12Fence;
         event:  HANDLE;
+    }
+
+
+    Texture_Filter :: enum {
+        LINEAR;
+        NEAREST;
+        ANISOTROPIC;
+    }
+
+    Address_Mode :: enum {
+        REPEAT;
+        MIRROR;
+        EDGE;
+        BORDER;
+    }
+
+    Compare_Op :: enum {
+        ALWAYS;
+        NEVER;
+        EQUAL;
+        NOT_EQUAL;
+        LESS;
+        LESS_EQUAL;
+        GREATER;
+        GREATER_EQUAL;
+    }
+
+    Sampler_Desc :: struct {
+        filter:          Texture_Filter;
+        address_u:       Address_Mode;
+        address_v:       Address_Mode;
+        address_w:       Address_Mode;
+        max_anisotropy:  u32;
+        compare_op:      Compare_Op;
+        border_color:    [4] float;
+        mip_lod_bias:    float;
+        min_lod:         float;
+        max_lod:         float;
+    }
+
+    Sampler :: struct {
+        descriptor: Descriptor;
+    }
+
+
+    Swapchain :: struct {
+        current_backbuffer:     u32;
+        swapchain_4:           *IDXGISwapChain4;
+        frame_waitable_object:  HANDLE;
     }
 
 
@@ -153,7 +203,7 @@
             #if DEBUG {
                 flags: u32;
             } else {
-                flags: u32 = .DXGI_CREATE_FACTORY_DEBUG;
+                flags: u32 = DXGI_CREATE_FACTORY_DEBUG;
             }
             hr = CreateDXGIFactory2(flags, *uid(IDXGIFactory6_UUID), xx *factory_6);
 
@@ -503,6 +553,115 @@
     }
 
 
+    init_sampler :: (device: *Device, s: *Sampler, using desc: Sampler_Desc) {
+        s.descriptor = alloc_descriptor(*device.sampler_heap);
+
+        compare := (compare_op != .ALWAYS);
+
+        sampler_desc: D3D12_SAMPLER_DESC = .{
+            Filter         = to_d3d12_filter(filter, compare),
+            AddressU       = to_d3d12_address_mode(address_u),
+            AddressV       = to_d3d12_address_mode(address_v),
+            AddressW       = to_d3d12_address_mode(address_w),
+            MipLODBias     = mip_lod_bias,
+            MaxAnisotropy  = max_anisotropy,
+            ComparisonFunc = ifx compare then to_d3d12_comparison_func(compare_op) else .NONE,
+            BorderColor    = border_color,
+            MinLOD         = min_lod,
+            MaxLOD         = max_lod
+        };
+
+        // Seems like it can't fail.
+        ID3D12Device_CreateSampler(device.device_0, *sampler_desc, s.descriptor.cpu_handle);
+    }
+
+    deinit_sampler :: (s: *Sampler) {
+        dealloc_descriptor(*s.descriptor);
+        memset(s, 0, size_of(Sampler));
+    }
+
+
+    init_swapchain :: (device:          *Device, 
+                       s:               *Swapchain, 
+                       native_window:   *void, 
+                       width:            u32, 
+                       height:           u32, 
+                       backbuffer_count: u32) -> bool {
+
+        hwnd: HWND = cast(HWND) native_window;
+
+        swapchain_desc: DXGI_SWAP_CHAIN_DESC1 = .{
+            Width  = width,
+            Height = height,
+            Format = .R8G8B8A8_UNORM,
+            Stereo = .FALSE,
+
+            // FLIP presentation model disallow MSAA framebuffer.
+            // If one wants MSAA, render offscreen and manually 
+            // resolve to non-MSAA framebuffer.
+            SampleDesc = .{ 1, 0 },
+
+            BufferUsage = .RENDER_TARGET_OUTPUT | .SHADER_INPUT,
+            BufferCount = backbuffer_count,
+            Scaling = .NONE,
+
+            SwapEffect = .FLIP_DISCARD,
+            AlphaMode = .UNSPECIFIED,
+            Flags = xx DXGI_SWAP_CHAIN_FLAG.FRAME_LATENCY_WAITABLE_OBJECT
+        };
+
+        // Tearing?
+        allow_tearing: BOOL = .FALSE;
+        if FAILED(IDXGIFactory5_CheckFeatureSupport(device.factory_6, .PRESENT_ALLOW_TEARING, *allow_tearing, size_of(BOOL))) {
+            log_error("Error while checking support for allow tearing feature.");
+            return false;
+        }
+
+        if allow_tearing  swapchain_desc.Flags |= xx DXGI_SWAP_CHAIN_FLAG.ALLOW_TEARING;
+
+
+        swapchain_1: *IDXGISwapChain1;
+        defer safe_release(swapchain_1);
+        hr := IDXGIFactory2_CreateSwapChainForHwnd(device.factory_6, device.graphics_queue.queue_0, hwnd, *swapchain_desc, null, null, *swapchain_1);
+        if FAILED(hr) {
+            log_error("IDXGIFactory2_CreateSwapChainForHwnd failed.");
+            return false;
+        }
+
+        hr = IUnknown_QueryInterface(swapchain_1, *uid(IDXGISwapChain4_UUID), xx *s.swapchain_4);
+        if FAILED(hr) {
+            log_error("QueryInterface for IDXGISwapChain4 failed.");
+            return false;
+        }
+
+
+        // Disable Alt + Enter changing monitor resolution to match window size.
+        IDXGIFactory_MakeWindowAssociation(device.factory_6, hwnd, xx DXGI_MWA.NO_ALT_ENTER);
+
+
+        // Get initial backbuffer index.
+        s.current_backbuffer = IDXGISwapChain3_GetCurrentBackBufferIndex(s.swapchain_4);
+
+
+        // Get frame waitable object.
+        s.frame_waitable_object = IDXGISwapChain2_GetFrameLatencyWaitableObject(s.swapchain_4);
+        if IDXGISwapChain2_SetMaximumFrameLatency(s.swapchain_4, backbuffer_count - 1) != S_OK {
+            log_error("IDXGISwapChain2_SetMaximumFrameLatency() failed.");
+            return false;
+        }
+
+        return true;
+    }
+
+    deinit_swapchain :: (s: *Swapchain) {
+        safe_release(s.swapchain_4);
+        memset(s, 0, size_of(Swapchain));
+    }
+
+
+    
+
+
 
 
     #scope_file
@@ -510,6 +669,40 @@
 
     MAX_32BIT_PUSH_CONSTANTS :: 32;
 
+    #if DEBUG {
+        d3d12_log :: (severity: D3D12_MESSAGE_SEVERITY, description: *u8) #no_context {
+            strlen :: (s: *u8) -> s64 #no_context {
+                count: s64 = 0;
+
+                while s.* {
+                    count += 1;
+                    s += 1;
+                }
+
+                return count;
+            }
+
+            s: string = ---;
+            s.data  = description;
+            s.count = strlen(description);
+
+            // @Incomplete
+        }
+
+        d3d12_message_callback :: (category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, description: *u8, user_data: *void) #c_call {
+            if #complete severity == {
+                case .CORRUPTION; #through;
+                case .ERROR;      #through;
+                case .WARNING;
+                    if description  d3d12_log(severity, description);
+                    debug_break();
+
+                case .INFO;
+                case .MESSAGE;
+                    if description  d3d12_log(severity, description);
+            }
+        }
+    }
 
     safe_release :: (pptr: $T) {
         // @Robustness: my gut tells me I could check if it is a pointer or double pointer in Jai.
@@ -527,36 +720,39 @@
         }
     }
 
-    d3d12_log :: (severity: D3D12_MESSAGE_SEVERITY, description: *u8) #no_context {
-        strlen :: (s: *u8) -> s64 #no_context {
-            count: s64 = 0;
-
-            while s.* {
-                count += 1;
-                s += 1;
-            }
-
-            return count;
+    to_d3d12_filter :: (filter: Texture_Filter, compare: bool) -> D3D12_FILTER {
+        if #complete filter == {
+            case .LINEAR;
+                if compare then return .COMPARISON_MIN_MAG_MIP_LINEAR;
+                           else return .MIN_MAG_MIP_LINEAR;
+            case .NEAREST;
+                if compare then return .COMPARISON_MIN_MAG_MIP_POINT;
+                           else return .MIN_MAG_MIP_POINT;
+            case .ANISOTROPIC;
+                if compare then return .COMPARISON_ANISOTROPIC;
+                           else return .ANISOTROPIC;
         }
-
-        s: string = ---;
-        s.data  = description;
-        s.count = strlen(description);
-
-        // @Incomplete
     }
 
-    d3d12_message_callback :: (category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, description: *u8, user_data: *void) #c_call {
-        if #complete severity == {
-            case .CORRUPTION; #through;
-            case .ERROR;      #through;
-            case .WARNING;
-                if description  d3d12_log(severity, description);
-                debug_break();
+    to_d3d12_address_mode :: (mode: Address_Mode) -> D3D12_TEXTURE_ADDRESS_MODE {
+        if #complete mode == {
+            case .REPEAT;  return .WRAP;
+            case .MIRROR;  return .MIRROR;
+            case .EDGE;    return .CLAMP;
+            case .BORDER;  return .BORDER;
+        }
+    }
 
-            case .INFO;
-            case .MESSAGE;
-                if description  d3d12_log(severity, description);
+    to_d3d12_comparison_func :: (op: Compare_Op) -> D3D12_COMPARISON_FUNC {
+        if #complete op == {
+            case .ALWAYS;        return .ALWAYS;
+            case .NEVER;         return .NEVER;
+            case .EQUAL;         return .EQUAL;
+            case .NOT_EQUAL;     return .NOT_EQUAL;
+            case .LESS;          return .LESS;
+            case .LESS_EQUAL;    return .LESS_EQUAL;
+            case .GREATER;       return .GREATER;
+            case .GREATER_EQUAL; return .GREATER_EQUAL;
         }
     }
 
@@ -588,10 +784,6 @@
     deinit_command_queue :: (using queue: *Command_Queue) {
         IUnknown_Release(xx queue_0);
         queue_0 = null;
-    }
-
-    is_shader_visible :: (type: D3D12_DESCRIPTOR_HEAP_TYPE) -> bool {
-        return type == .CBV_SRV_UAV || type == .SAMPLER;
     }
 
     init_descriptor_heap :: (device: *Device, 
@@ -639,5 +831,9 @@
 
     deinit_descriptor_heap :: (heap: *Descriptor_Heap) {
         safe_release(*heap.heap_0);
+    }
+
+    is_shader_visible :: (type: D3D12_DESCRIPTOR_HEAP_TYPE) -> bool {
+        return type == .CBV_SRV_UAV || type == .SAMPLER;
     }
 }
