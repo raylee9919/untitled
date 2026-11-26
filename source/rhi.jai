@@ -2,8 +2,10 @@
 
 #if OS == .WINDOWS {
 
-    #import     "d3d12"()(INCLUDE_DEBUG_BINDINGS = DEBUG);
-    #import     "d3d_compiler";
+    #import "d3d12"()(INCLUDE_DEBUG_BINDINGS = DEBUG);
+    #import "d3d_compiler";
+    #load   "ThirdParty/D3D12MemoryAllocator/bindings.jai";
+
 
     // @Todo: Check if it works as expected.
     #program_export D3D12SDKVersion: u32 = 619;
@@ -38,6 +40,8 @@
         sampler\_heap: Descriptor_Heap;
 
         global_root_signature: *ID3D12RootSignature;
+
+        d3d12ma: *D3D12MA.Allocator;
     }
 
     Command_Type :: enum {
@@ -86,7 +90,7 @@
 
     Descriptor :: struct {
         type:        D3D12_DESCRIPTOR_HEAP_TYPE;
-        index:       int;
+        index:       u32;
         heap:       *Descriptor_Heap;
         cpu_handle:  D3D12_CPU_DESCRIPTOR_HANDLE;
         gpu_handle:  D3D12_GPU_DESCRIPTOR_HANDLE;
@@ -145,6 +149,40 @@
         current_backbuffer:     u32;
         swapchain_4:           *IDXGISwapChain4;
         frame_waitable_object:  HANDLE;
+        allow_tearing:          bool;
+    }
+
+    Allocation_Kind :: enum {
+        BUFFER             :: 0;
+        NON_RT_DS_TEXTURES :: 1;
+        RT_DS_TEXTURES     :: 2;
+    }
+
+    Allocation_Priority :: enum {
+        LOW    :: 0;
+        NORMAL :: 1;
+        HIGH   :: 2;
+    }
+
+    Memory_Allocator :: struct {
+        memory_type:  Memory_Type;
+        kind:         Allocation_Kind;
+        priority:     Allocation_Priority;
+        pool:        *D3D12MA.Pool;
+    }
+
+    Buffer :: struct {
+        memory_type:  Memory_Type;
+        size:         u64;
+        allocation:  *D3D12MA.Allocation;
+        resource:    *ID3D12Resource;
+    }
+
+    Buffer_View :: struct {
+        descriptor: Descriptor;
+        offset:     s64;
+        size:       s64;
+        writable:   bool;
     }
 
 
@@ -215,6 +253,7 @@
 
 
         adapter_1: *IDXGIAdapter1;
+        defer safe_release(*adapter_1);
         {
             adapter_index: u32;
             preference: DXGI_GPU_PREFERENCE = .DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE;
@@ -324,9 +363,9 @@
 
         // Initialize command queues.
         ok := true;
-        ok &&= init_command_queue(device, *device.graphics_queue, d3d12_command_type_from_rhi(.GRAPHICS));
-        ok &&= init_command_queue(device, *device.compute\_queue, d3d12_command_type_from_rhi(.COMPUTE));
-        ok &&= init_command_queue(device, *device.transfer_queue, d3d12_command_type_from_rhi(.TRANSFER));
+        ok &&= init_command_queue(device, *device.graphics_queue, to_d3d12_command_type(.GRAPHICS));
+        ok &&= init_command_queue(device, *device.compute\_queue, to_d3d12_command_type(.COMPUTE));
+        ok &&= init_command_queue(device, *device.transfer_queue, to_d3d12_command_type(.TRANSFER));
         if !ok  return false;
 
 
@@ -352,8 +391,12 @@
             Flags             = .ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | .CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | .SAMPLER_HEAP_DIRECTLY_INDEXED
         };
 
-        signature_blob: *ID3DBlob;
+        signature_blob: *ID3DBlob; 
         error\   _blob: *ID3DBlob;
+
+        defer safe_release(*signature_blob);
+        defer safe_release(*error_blob);
+
 
         hr = D3D12SerializeRootSignature(*root_signature_desc, .D3D_ROOT_SIGNATURE_VERSION_1, *signature_blob, *error_blob);
         if hr != S_OK {
@@ -367,9 +410,22 @@
             return false;
         }
 
-        safe_release(*signature_blob);
-        safe_release(*error\   _blob);
-        safe_release(*adapter_1);
+
+        // Initialize D3D12 Memory Allocator
+        {
+            desc: D3D12MA.ALLOCATOR_DESC;
+            using desc;
+
+            Flags    = .DEFAULT_POOLS_NOT_ZEROED | .MSAA_TEXTURES_ALWAYS_COMMITTED;
+            pDevice  = device_10;
+            pAdapter = adapter_1;
+
+            if FAILED(D3D12MA.CreateAllocator(*desc, *device.d3d12ma)) {
+                log_error("D3D12MA::CreateAllocator() failed.");
+                return false;
+            }
+        }
+
 
         return true;
     }
@@ -428,7 +484,7 @@
 
         result: Descriptor = .{
             type       = heap.type,
-            index      = index,
+            index      = cast(u32) index,
             heap       = heap,
             cpu_handle = .{ heap.base_cpu_handle.ptr + xx offset },
         };
@@ -617,7 +673,10 @@
             return false;
         }
 
-        if allow_tearing  swapchain_desc.Flags |= xx DXGI_SWAP_CHAIN_FLAG.ALLOW_TEARING;
+        if allow_tearing {
+            swapchain_desc.Flags |= xx DXGI_SWAP_CHAIN_FLAG.ALLOW_TEARING;
+            s.allow_tearing = true;
+        }
 
 
         swapchain_1: *IDXGISwapChain1;
@@ -658,8 +717,287 @@
         memset(s, 0, size_of(Swapchain));
     }
 
+    present :: (s: *Swapchain, sync_interval: u32) {
+        flags: u32;
+        if sync_interval == 0 {
+            assert(s.allow_tearing, "Tearing is not allowed for the swapchain.");
+            flags = xx DXGI_PRESENT.ALLOW_TEARING;
+        }
+        IDXGISwapChain_Present(s.swapchain_4, sync_interval, flags);
+        s.current_backbuffer = IDXGISwapChain3_GetCurrentBackBufferIndex(s.swapchain_4);
+    }
 
-    
+
+    set_viewport :: (encoder: *Command_Encoder, 
+                     x:         float, y:         float, 
+                     width:     float, height:    float, 
+                     min_depth: float, max_depth: float) {
+        viewport: D3D12_VIEWPORT = .{
+            TopLeftX = x,
+            TopLeftY = y,
+            Width    = width, 
+            Height   = height,
+            MinDepth = min_depth,
+            MaxDepth = max_depth
+        };
+        ID3D12GraphicsCommandList_RSSetViewports(encoder.list_7, 1, *viewport);
+    }
+
+    set_scissor :: (encoder: *Command_Encoder, 
+                    x:     s32, y:      s32, 
+                    width: s32, height: s32) {
+        r: D3D12_RECT = .{
+            left   = x,
+            top    = y,
+            right  = x + width,
+            bottom = y + height
+        };
+        ID3D12GraphicsCommandList_RSSetScissorRects(encoder.list_7, 1, *r);
+    }
+
+    push_constants :: (encoder:    *Command_Encoder, 
+                       root_index:  u32, 
+                       data:       *void, 
+                       size:        s64) {
+        count := cast(u32) (size / 4);
+
+        if #complete encoder.type == {
+            case .GRAPHICS;
+                ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(encoder.list_7, root_index, count, data, 0);
+
+            case .COMPUTE;
+                ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(encoder.list_7, root_index, count, data, 0);
+
+            case .TRANSFER;
+                assert(false, "Pushing constants to transfer command encoder is not allowed.");
+        }
+    }
+
+    draw :: (encoder:       *Command_Encoder, 
+             num_vertices:   u32, 
+             num_instances:  u32, 
+             first_vertex:   u32, 
+             first_instance: u32) {
+        assert(encoder.type == .GRAPHICS);
+        ID3D12GraphicsCommandList_DrawInstanced(encoder.list_7, num_vertices, num_instances, first_vertex, first_instance);
+    }
+
+
+    signal_queue :: (device: *Device, type: Command_Type, semaphore: *Semaphore, value: u64) {
+        if #complete type == {
+            case .GRAPHICS;
+                ID3D12CommandQueue_Signal(device.graphics_queue.queue_0, semaphore.fence, value);
+            case .COMPUTE;
+                ID3D12CommandQueue_Signal(device.compute\_queue.queue_0, semaphore.fence, value);
+            case .TRANSFER;
+                ID3D12CommandQueue_Signal(device.transfer_queue.queue_0, semaphore.fence, value);
+        }
+    }
+
+    wait_queue :: (device: *Device, type: Command_Type, semaphore: *Semaphore, value: u64) {
+        if #complete type == {
+            case .GRAPHICS;
+                ID3D12CommandQueue_Wait(device.graphics_queue.queue_0, semaphore.fence, value);
+            case .COMPUTE;
+                ID3D12CommandQueue_Wait(device.compute\_queue.queue_0, semaphore.fence, value);
+            case .TRANSFER;
+                ID3D12CommandQueue_Wait(device.transfer_queue.queue_0, semaphore.fence, value);
+        }
+    }
+
+    init_allocator :: (device: *Device, a: *Memory_Allocator, memory_type: Memory_Type, kind: Allocation_Kind, priority: Allocation_Priority, linear: bool) -> bool {
+        desc: D3D12MA.POOL_DESC;
+        {
+            using desc;
+
+            Flags = .MSAA_TEXTURES_ALWAYS_COMMITTED;
+            if linear {
+                Flags |= .ALGORITHM_LINEAR;
+            }
+
+            HeapProperties.Type = to_d3d12_heap_type(memory_type);
+
+            /*
+              NVIDIA Pascal (10 series) is heap tier 1, which means I can't just 
+              shove 'D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES' everywhere and 
+              forget about it.
+            */
+            HeapFlags = .NONE;
+
+            if #complete kind == {
+                case .BUFFER;             HeapFlags |= .ALLOW_ONLY_BUFFERS;
+                case .NON_RT_DS_TEXTURES; HeapFlags |= .ALLOW_ONLY_NON_RT_DS_TEXTURES;
+                case .RT_DS_TEXTURES;     HeapFlags |= .ALLOW_ONLY_RT_DS_TEXTURES;
+            }
+
+            if #complete priority == {
+                case .LOW;    ResidencyPriority = .LOW;
+                case .NORMAL; ResidencyPriority = .NORMAL;
+                case .HIGH;   ResidencyPriority = .HIGH;
+            }
+        }
+
+        if FAILED(D3D12MA.Allocator.CreatePool(device.d3d12ma, *desc, *a.pool)) {
+            log_error("D3D12MA::Allocator::CreatePool failed.");
+            return false;
+        }
+
+        a.memory_type = memory_type;
+        a.kind        = kind;
+        a.priority    = priority;
+
+        return true;
+    }
+
+    deinit_allocator :: (a: *Memory_Allocator) {
+        safe_release(*a.pool);
+        memset(a, 0, size_of(Memory_Allocator));
+    }
+
+    init_buffer :: (device:      *Device, 
+                    buffer:      *Buffer, 
+                    allocator:   *Memory_Allocator, 
+                    memory_type:  Memory_Type, 
+                    size:         u64, 
+                    first_fit:    bool, 
+                    use_own_heap: bool) -> bool {
+
+        if memory_type != allocator.memory_type {
+            log_error("Memory type mismatch: Buffer to be allocated and the allocator disagree with the memory type.");
+            return false;
+        }
+
+        if allocator.kind != .BUFFER {
+            log_error("Allocator type mismatch: expected 'RHI_ALLOCATOR_BUFFER' during buffer allocation.");
+            return false;
+        }
+
+        resource_desc: D3D12_RESOURCE_DESC = {
+            Dimension        = .BUFFER,
+            Alignment        = 0,
+            Width            = size,
+            Height           = 1,
+            DepthOrArraySize = 1,
+            MipLevels        = 1,
+            Format           = .UNKNOWN,
+            SampleDesc       = { 1, 0 },
+            Layout           = .ROW_MAJOR,
+            Flags            = .NONE
+        };
+
+        if memory_type != .UPLOAD && memory_type != .READBACK {
+            resource_desc.Flags = .ALLOW_UNORDERED_ACCESS;
+        }
+
+        initial_state := D3D12_RESOURCE_STATES.COMMON;
+
+        alloc_desc: D3D12MA.ALLOCATION_DESC;
+        {
+            using alloc_desc;
+
+            if first_fit {
+                Flags |= D3D12MA.ALLOCATION_FLAGS.STRATEGY_MIN_TIME;
+            } else {
+                Flags |= D3D12MA.ALLOCATION_FLAGS.STRATEGY_MIN_MEMORY;
+            }
+
+            if use_own_heap { 
+                Flags |= D3D12MA.ALLOCATION_FLAGS.COMMITTED;
+            }
+
+            CustomPool = allocator.pool;
+        }
+
+        clear_value := null;
+        hr := D3D12MA.Allocator.CreateResource(device.d3d12ma, *alloc_desc, *resource_desc, initial_state, clear_value, *buffer.allocation, *uid(ID3D12Resource_UUID), xx *buffer.resource);
+
+        if FAILED(hr) {
+            log_error("D3D12MA::Allocator::CreateResource failed.");
+            return false;
+        }
+
+        buffer.memory_type = memory_type;
+        buffer.size = size;
+
+        return true;
+    }
+
+    deinit_buffer :: (using buffer: *Buffer) {
+        safe_release(*resource);
+        safe_release(*allocation);
+        memset(buffer, 0, size_of(Buffer));
+    }
+
+    map :: (using b: *Buffer) -> *void {
+        ptr: *void;
+        read_range: D3D12_RANGE = { 0, 0 }; // No read.
+        hr := ID3D12Resource_Map(resource, 0, *read_range, *ptr);
+        if FAILED(hr) {
+            log_error("ID3D12Resource::Map failed.");
+            return null;
+        }
+        return ptr;
+    }
+
+    unmap :: (using b: *Buffer) {
+        written_range: D3D12_RANGE = { 0, size };
+        ID3D12Resource_Unmap(resource, 0, *written_range);
+    }
+
+    init_buffer_view :: (device: *Device, buffer: *Buffer, view: *Buffer_View, offset: int, size: int, writable: bool) {
+        // No structured/constant buffer view. Everything's raw. Bad perf? I dunno.
+        // Worth taking a look at https://github.com/sebbbi/perftest @Study
+
+        assert(offset % 4 == 0 && size % 4 == 0);
+
+        offset_index := cast(u64) offset / 4;
+        count        := cast(u32) size / 4;
+
+        view.descriptor = alloc_descriptor(*device.resource_heap);
+
+        if writable {
+            desc := D3D12_UNORDERED_ACCESS_VIEW_DESC.{
+                Format                     = .R32_TYPELESS,
+                ViewDimension              = .BUFFER,
+
+                Buffer = {
+                    FirstElement         = offset_index,
+                    NumElements          = count,
+                    StructureByteStride  = 0,
+                    CounterOffsetInBytes = 0,
+                    Flags                = .RAW
+                }
+            };
+            ID3D12Device_CreateUnorderedAccessView(device.device_0, buffer.resource, null, *desc, view.descriptor.cpu_handle);
+        } else {
+            desc := D3D12_SHADER_RESOURCE_VIEW_DESC.{
+                Format                     = .R32_TYPELESS,
+                ViewDimension              = .BUFFER,
+                Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+
+                Buffer = {
+                    FirstElement        = offset_index,
+                    NumElements         = count,
+                    StructureByteStride = 0,
+                    Flags               = .RAW
+                }
+            };
+            ID3D12Device_CreateShaderResourceView(device.device_0, buffer.resource, *desc, view.descriptor.cpu_handle);
+        }
+
+        view.offset   = offset;
+        view.size     = size;
+        view.writable = writable;
+    }
+
+    deinit_buffer_view :: (using view: *Buffer_View) {
+        dealloc_descriptor(*descriptor);
+        memset(view, 0, size_of(Buffer_View));
+    }
+
+    copy_buffer_to_buffer :: (encoder: *Command_Encoder, dst: *Buffer, dst_offset: u64, src: *Buffer, src_offset: u64, size: u64) {
+        ID3D12GraphicsCommandList_CopyBufferRegion(encoder.list_7, dst.resource, dst_offset, src.resource, src_offset, size);
+    }
 
 
 
@@ -667,7 +1005,9 @@
     #scope_file
 
 
+    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING :: 5768; // @Robustness
     MAX_32BIT_PUSH_CONSTANTS :: 32;
+
 
     #if DEBUG {
         d3d12_log :: (severity: D3D12_MESSAGE_SEVERITY, description: *u8) #no_context {
@@ -712,14 +1052,6 @@
         }
     }
 
-    to_d3d12_command_type :: (type: Command_Type) -> D3D12_COMMAND_LIST_TYPE {
-        if #complete type == {
-            case .GRAPHICS;  return .DIRECT;
-            case .COMPUTE;   return .COMPUTE;
-            case .TRANSFER;  return .COPY;
-        }
-    }
-
     to_d3d12_filter :: (filter: Texture_Filter, compare: bool) -> D3D12_FILTER {
         if #complete filter == {
             case .LINEAR;
@@ -756,11 +1088,19 @@
         }
     }
 
-    d3d12_command_type_from_rhi :: (type: Command_Type) -> D3D12_COMMAND_LIST_TYPE {
+    to_d3d12_command_type :: (type: Command_Type) -> D3D12_COMMAND_LIST_TYPE {
         if #complete type == {
             case .GRAPHICS;  return .DIRECT;
             case .COMPUTE;   return .COMPUTE;
             case .TRANSFER;  return .COPY;
+        }
+    }
+
+    to_d3d12_heap_type :: (type: Memory_Type) -> D3D12_HEAP_TYPE {
+        if #complete type == {
+            case .GPU_ONLY;  return .DEFAULT;
+            case .UPLOAD;    return .UPLOAD;
+            case .READBACK;  return .READBACK;
         }
     }
 
@@ -823,8 +1163,15 @@
 
 
         // Make a free list
-        heap.node_count = heap.allocated / 64;
-        heap.free_list = alloc(size_of(u64) * heap.node_count);
+        {
+            node_count := heap.allocated / 64;
+            sz := size_of(u64) * node_count;
+
+            heap.node_count = node_count;
+            heap.free_list  = alloc(sz);
+
+            memset(heap.free_list, 0xff, sz); // fill with 1s
+        }
 
         return true;
     }
