@@ -15,6 +15,16 @@ build :: () {
 
     options.output_executable_name = EXECUTABLE_NAME;
 
+
+    // Set import paths
+    import_paths: [..] string;
+    for options.import_path {
+        array_add(*import_paths, it);
+    }
+    array_add(*import_paths, tprint("%source", #filepath));
+    options.import_path = import_paths;
+
+
     w := compiler_create_workspace();
 
     build_debug := true;

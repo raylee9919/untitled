@@ -6,15 +6,16 @@ PATH            :: "source/ThirdParty/D3D12MemoryAllocator";
 FILENAME        :: "bindings.jai";
 
 #run,stallable {
+    set_working_directory(#filepath);
+
     if !generate_bindings() {
         compiler_set_workspace_status(.FAILED);
     }
+
     delete_directory(".build");
 }
 
 generate_bindings :: () -> bool {
-
-    set_working_directory(#filepath);
     set_build_options_dc(.{do_output=false});
     args := get_build_options().compile_time_command_line;
 

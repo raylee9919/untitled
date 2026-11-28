@@ -2,7 +2,8 @@
 
 #if OS == .WINDOWS {
 
-    #import "d3d12"()(INCLUDE_DEBUG_BINDINGS = DEBUG);
+    #import "ThirdParty/DXGI";
+    #import "ThirdParty/D3D12"()(INCLUDE_DEBUG_BINDINGS = DEBUG);
     #import "d3d_compiler";
     #load   "ThirdParty/D3D12MemoryAllocator/bindings.jai";
 
@@ -96,12 +97,10 @@
         gpu_handle:  D3D12_GPU_DESCRIPTOR_HANDLE;
     }
 
-
     Semaphore :: struct {
         fence: *ID3D12Fence;
         event:  HANDLE;
     }
-
 
     Texture_Filter :: enum {
         LINEAR;
@@ -144,7 +143,6 @@
         descriptor: Descriptor;
     }
 
-
     Swapchain :: struct {
         current_backbuffer:     u32;
         swapchain_4:           *IDXGISwapChain4;
@@ -171,11 +169,17 @@
         pool:        *D3D12MA.Pool;
     }
 
-    Buffer :: struct {
-        memory_type:  Memory_Type;
-        size:         u64;
+    Resource :: struct {
         allocation:  *D3D12MA.Allocation;
         resource:    *ID3D12Resource;
+        state:        D3D12_RESOURCE_STATES;
+    }
+
+    Buffer :: struct {
+        #as using base: Resource;
+
+        memory_type:  Memory_Type;
+        size:         u64;
     }
 
     Buffer_View :: struct {
@@ -184,6 +188,87 @@
         size:       s64;
         writable:   bool;
     }
+
+    Texture :: struct {
+        #as using base: Resource;
+
+        using desc: Texture_Desc;
+    }
+
+    Texture_View :: struct {
+        descriptor: Descriptor;
+    }
+
+    Dimension :: enum {
+        _1D;
+        _2D; 
+        _2D_ARRAY;
+        _3D;
+        CUBE;
+    }
+
+    Format :: enum {
+        UNKNOWN :: 0;
+
+        R8_UNORM;
+        RG8_UNORM;
+        RGBA8_UNORM;
+        BGRA8_UNORM;
+        RGBA8_UNORM_SRGB;
+        BGRA8_UNORM_SRGB;
+
+        R16_UNORM;
+        RG16_UNORM;
+        RGBA16_UNORM;
+
+        R16F;
+        RG16F;
+        RGBA16F;
+
+        R32F;
+        RG32F;
+        RGBA32F;
+
+        D32F;
+
+        BC1_UNORM;
+        BC1_UNORM_SRGB;
+        BC3_UNORM;
+        BC3_UNORM_SRGB;
+        BC4_UNORM;
+        BC5_UNORM;
+        BC6H_UFLOAT;
+        BC7_UNORM;
+        BC7_UNORM_SRGB;
+    }
+
+    Usage_Flags :: enum_flags {
+        SAMPLED                  :: 0x1;
+        UNORDERED_ACCESS         :: 0x2;
+        COLOR_ATTACHMENT         :: 0x4;
+        DEPTH_STENCIL_ATTACHMENT :: 0x8;
+    }
+
+    Texture_Desc :: struct {
+        dimension:   Dimension;
+        format:      Format;
+        usage_flags: Usage_Flags;
+        name:        string;
+        width:       u32;
+        height:      u32;
+        mip_levels:  u16;
+        depth:       u16; // or array length
+    }
+
+    Clear_Op :: struct {
+        clear_depth_stencil: bool;
+
+        color: [4] float;
+
+        #overlay (color[0]) depth:   float;
+        #overlay (color[1]) stencil: u8;
+    }
+
 
 
     init_device :: (device: *Device, allocator: Allocator) -> bool {
@@ -782,6 +867,24 @@
         ID3D12GraphicsCommandList_DrawInstanced(encoder.list_7, num_vertices, num_instances, first_vertex, first_instance);
     }
 
+    draw_indexed :: (encoder:       *Command_Encoder, 
+                     index_buffer:  *Buffer,
+                     index_size:     u32,
+                     num_indices:    u32, 
+                     num_instances:  u32,
+                     first_index:    u32, 
+                     first_vertex:   u32,
+                     first_instance: u32) {
+         view := D3D12_INDEX_BUFFER_VIEW.{
+             BufferLocation = ID3D12Resource_GetGPUVirtualAddress(index_buffer.resource),
+             Format         = ifx index_size == 2 then .R16_UINT else .R32_UINT,
+             SizeInBytes    = cast(u32) index_buffer.size
+         };
+
+         ID3D12GraphicsCommandList_IASetIndexBuffer(encoder.list_7, *view);
+         ID3D12GraphicsCommandList_DrawIndexedInstanced(encoder.list_7, num_indices, num_instances, first_index, cast(s32) first_vertex, first_instance);
+     }
+
 
     signal_queue :: (device: *Device, type: Command_Type, semaphore: *Semaphore, value: u64) {
         if #complete type == {
@@ -859,7 +962,6 @@
                     allocator:   *Memory_Allocator, 
                     memory_type:  Memory_Type, 
                     size:         u64, 
-                    first_fit:    bool, 
                     use_own_heap: bool) -> bool {
 
         if memory_type != allocator.memory_type {
@@ -895,11 +997,7 @@
         {
             using alloc_desc;
 
-            if first_fit {
-                Flags |= D3D12MA.ALLOCATION_FLAGS.STRATEGY_MIN_TIME;
-            } else {
-                Flags |= D3D12MA.ALLOCATION_FLAGS.STRATEGY_MIN_MEMORY;
-            }
+            Flags |= D3D12MA.ALLOCATION_FLAGS.STRATEGY_MIN_MEMORY;
 
             if use_own_heap { 
                 Flags |= D3D12MA.ALLOCATION_FLAGS.COMMITTED;
@@ -918,13 +1016,13 @@
 
         buffer.memory_type = memory_type;
         buffer.size = size;
+        buffer.state = initial_state;
 
         return true;
     }
 
     deinit_buffer :: (using buffer: *Buffer) {
-        safe_release(*resource);
-        safe_release(*allocation);
+        release_resource(buffer);
         memset(buffer, 0, size_of(Buffer));
     }
 
@@ -995,9 +1093,101 @@
         memset(view, 0, size_of(Buffer_View));
     }
 
+
+    init_texture :: (device:      *Device, 
+                     allocator:   *Memory_Allocator,
+                     use_own_heap: bool,
+                     texture:     *Texture,
+                     using desc:   Texture_Desc, 
+                     clear_op:    *Clear_Op = null) -> bool {
+
+        resource_desc := D3D12_RESOURCE_DESC.{
+            Dimension        = to_d3d12_dimension(dimension),
+            Alignment        = 0,
+            Width            = width,
+            Height           = height,
+            DepthOrArraySize = depth,
+            MipLevels        = mip_levels,
+            Format           = to_dxgi_format(format),
+            SampleDesc       = .{1,0},
+            Layout           = .UNKNOWN,
+            Flags            = to_d3d12_resource_flags(usage_flags)
+        };
+
+        if usage_flags & .COLOR_ATTACHMENT || usage_flags & .DEPTH_STENCIL_ATTACHMENT {
+            if allocator.kind != .RT_DS_TEXTURES {
+                log_error("Allocator kind mismatch: expected '.RT_DS_TEXTURES'.");
+                return false;
+            }
+        } else if (allocator.kind != .NON_RT_DS_TEXTURES) {
+            log_error("Allocator kind mismatch: expected '.NON_RT_DS_TEXTURES'.");
+            return false;
+        }
+
+        clear_value: D3D12_CLEAR_VALUE;
+        if clear_op {
+            using clear_op;
+            using clear_value;
+
+            Format = resource_desc.Format;
+
+            if clear_depth_stencil {
+                DepthStencil.Depth   = depth;
+                DepthStencil.Stencil = stencil;
+            } else {
+                Color = color;
+            }
+        }
+   
+
+        alloc_desc: D3D12MA.ALLOCATION_DESC;
+        {
+            using alloc_desc;
+
+            Flags |= D3D12MA.ALLOCATION_FLAGS.STRATEGY_MIN_MEMORY;
+
+            if use_own_heap { 
+                Flags |= D3D12MA.ALLOCATION_FLAGS.COMMITTED;
+            }
+
+            CustomPool = allocator.pool;
+        }
+
+        initial_state := D3D12_RESOURCE_STATES.COMMON;
+
+        hr := D3D12MA.Allocator.CreateResource(device.d3d12ma, *alloc_desc, *resource_desc, initial_state, ifx clear_op then *clear_value else null, *texture.allocation, *uid(ID3D12Resource_UUID), xx *texture.resource);
+
+        if FAILED(hr) {
+            log_error("D3D12MA::Allocator::CreateResource failed.");
+            return false;
+        }
+
+        texture.state = initial_state;
+
+        return true;
+    }
+
+    deinit_texture :: (using texture: *Texture) {
+        release_resource(texture);
+        memset(texture, 0, size_of(Texture));
+    }
+
+    init_texture_view :: (device: *Device, texture: *Texture, view: *Texture_View) {
+        // @Todo
+        desc := to_srv(texture);
+        ID3D12Device_CreateShaderResourceView(device.device_10, texture.resource, *desc, view.descriptor.cpu_handle);
+    }
+
+    deinit_texture_view :: (view: *Texture_View) {
+        dealloc_descriptor(*view.descriptor);
+        memset(view, 0, size_of(Texture_View));
+    }
+
+
     copy_buffer_to_buffer :: (encoder: *Command_Encoder, dst: *Buffer, dst_offset: u64, src: *Buffer, src_offset: u64, size: u64) {
         ID3D12GraphicsCommandList_CopyBufferRegion(encoder.list_7, dst.resource, dst_offset, src.resource, src_offset, size);
     }
+
 
 
 
@@ -1042,6 +1232,11 @@
                     if description  d3d12_log(severity, description);
             }
         }
+    }
+
+    release_resource :: (using r: *Resource) {
+        safe_release(resource);
+        safe_release(allocation);
     }
 
     safe_release :: (pptr: $T) {
@@ -1102,6 +1297,223 @@
             case .UPLOAD;    return .UPLOAD;
             case .READBACK;  return .READBACK;
         }
+    }
+
+    to_d3d12_dimension :: (d: Dimension) -> D3D12_RESOURCE_DIMENSION {
+        if #complete d == {
+            case ._1D;       return .TEXTURE1D;
+            case ._2D;       return .TEXTURE2D;
+            case ._2D_ARRAY; return .TEXTURE2D;
+            case ._3D;       return .TEXTURE3D;
+            case .CUBE;      return .TEXTURE2D;
+        }
+    }
+
+    to_d3d12_resource_flags :: (using usage: Usage_Flags) -> D3D12_RESOURCE_FLAGS {
+        flags: D3D12_RESOURCE_FLAGS;
+        if usage & .UNORDERED_ACCESS          flags |= .ALLOW_UNORDERED_ACCESS;
+        if usage & .COLOR_ATTACHMENT          flags |= .ALLOW_RENDER_TARGET;
+        if usage & .DEPTH_STENCIL_ATTACHMENT  flags |= .ALLOW_DEPTH_STENCIL;
+        return flags;
+    }
+
+    to_dxgi_format :: (format: Format) -> DXGI_FORMAT {
+        if #complete format == {
+            case .UNKNOWN;             return .UNKNOWN;       
+
+            case .R8_UNORM;            return .R8_UNORM;                                      
+            case .RG8_UNORM;           return .R8G8_UNORM;                       
+            case .RGBA8_UNORM;         return .R8G8B8A8_UNORM;                       
+            case .BGRA8_UNORM;         return .B8G8R8A8_UNORM;                       
+            case .RGBA8_UNORM_SRGB;    return .R8G8B8A8_UNORM_SRGB;                        
+            case .BGRA8_UNORM_SRGB;    return .B8G8R8A8_UNORM_SRGB;                        
+
+            case .R16_UNORM;           return .R16_UNORM;                       
+            case .RG16_UNORM;          return .R16G16_UNORM;                       
+            case .RGBA16_UNORM;        return .R16G16B16A16_UNORM;                       
+
+            case .R16F;                return .R16_FLOAT;
+            case .RG16F;               return .R16G16_FLOAT;
+            case .RGBA16F;             return .R16G16B16A16_FLOAT;
+
+            case .R32F;                return .R32_FLOAT;
+            case .RG32F;               return .R32G32_FLOAT;
+            case .RGBA32F;             return .R32G32B32A32_FLOAT;
+
+            case .D32F;                return .D32_FLOAT;
+
+            case .BC1_UNORM;           return .BC1_UNORM;                       
+            case .BC1_UNORM_SRGB;      return .BC1_UNORM_SRGB;                       
+            case .BC3_UNORM;           return .BC3_UNORM;                       
+            case .BC3_UNORM_SRGB;      return .BC3_UNORM_SRGB;                       
+            case .BC4_UNORM;           return .BC4_UNORM;                       
+            case .BC5_UNORM;           return .BC5_UNORM;                       
+            case .BC6H_UFLOAT;         return .BC6H_UF16;                       
+            case .BC7_UNORM;           return .BC7_UNORM;                       
+            case .BC7_UNORM_SRGB;      return .BC7_UNORM_SRGB;                       
+        }
+    }
+
+    to_srv :: (using texture: *Texture) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+        using result := D3D12_SHADER_RESOURCE_VIEW_DESC.{
+            Format                  = to_dxgi_format(texture.format),
+            Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        };
+
+        if #complete dimension == {
+            case ._1D;
+                ViewDimension = .TEXTURE1D;
+                Texture1D = .{
+                    MostDetailedMip = 0,
+                    MipLevels       = mip_levels,
+                };
+            case ._2D; 
+                ViewDimension = .TEXTURE2D;
+                Texture2D = .{
+                    MostDetailedMip = 0,
+                    MipLevels       = mip_levels,
+                };
+            case ._2D_ARRAY;
+                ViewDimension = .TEXTURE2DARRAY;
+                Texture2DArray = .{
+                    MostDetailedMip = 0,
+                    MipLevels       = mip_levels,
+                    FirstArraySlice = 0,
+                    ArraySize       = depth,
+                };
+            case ._3D;
+                ViewDimension = .TEXTURE3D;
+                Texture3D = .{
+                    MostDetailedMip = 0,
+                    MipLevels       = mip_levels
+                };
+            case .CUBE;
+                ViewDimension = .TEXTURECUBE;
+                TextureCube = .{
+                    MostDetailedMip = 0,
+                    MipLevels       = mip_levels
+                };
+        }
+
+        return result;
+    }
+
+    to_uav :: (using texture: *Texture) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        using result := D3D12_UNORDERED_ACCESS_VIEW_DESC.{
+            Format = to_dxgi_format(texture.format),
+        };
+
+        if #complete dimension == {
+            case ._1D;
+                ViewDimension = .TEXTURE1D;
+                Texture1D = .{
+                    MipSlice = 0
+                };
+
+            case ._2D; 
+                ViewDimension = .TEXTURE2D;
+                Texture2D = .{
+                    MipSlice   = 0,
+                    PlaneSlice = 0
+                };
+
+            case ._2D_ARRAY; #through;
+            case .CUBE;
+                ViewDimension = .TEXTURE2DARRAY;
+                Texture2DArray = .{
+                    MipSlice        = 0,
+                    FirstArraySlice = 0,
+                    ArraySize       = depth,
+                    PlaneSlice      = 0,
+                };
+
+            case ._3D;
+                // @Study: Unsure of WSlice and WSize.
+                ViewDimension = .TEXTURE3D;
+                Texture3D = .{
+                    MipSlice    = 0,
+                    FirstWSlice = 0,
+                    WSize       = depth
+                };
+        }
+
+        return result;
+    }
+
+    to_rtv :: (using texture: *Texture) -> D3D12_RENDER_TARGET_VIEW_DESC {
+        using result := D3D12_RENDER_TARGET_VIEW_DESC.{
+            Format = to_dxgi_format(texture.format),
+        };
+
+        if #complete dimension == {
+            case ._1D;
+                ViewDimension = .TEXTURE1D;
+                Texture1D = .{
+                    MipSlice = 0
+                };
+
+            case ._2D; 
+                ViewDimension = .TEXTURE2D;
+                Texture2D = .{
+                    MipSlice   = 0,
+                    PlaneSlice = 0
+                };
+
+            case ._2D_ARRAY; #through;
+            case .CUBE;
+                ViewDimension = .TEXTURE2DARRAY;
+                Texture2DArray = .{
+                    MipSlice        = 0,
+                    FirstArraySlice = 0,
+                    ArraySize       = depth,
+                    PlaneSlice      = 0
+                };
+
+            case ._3D;
+                // @Study: Unsure of WSlice and WSize.
+                ViewDimension = .TEXTURE3D;
+                Texture3D = .{
+                    MipSlice    = 0,
+                    FirstWSlice = 0,
+                    WSize       = depth
+                };
+        }
+
+        return result;
+    }
+
+    to_dsv :: (using texture: *Texture) -> D3D12_DEPTH_STENCIL_VIEW_DESC {
+        using result := D3D12_DEPTH_STENCIL_VIEW_DESC.{
+            Format = to_dxgi_format(texture.format),
+        };
+
+        if #complete dimension == {
+            case ._1D;
+                ViewDimension = .TEXTURE1D;
+                Texture1D = .{
+                    MipSlice = 0
+                };
+
+            case ._2D; 
+                ViewDimension = .TEXTURE2D;
+                Texture2D = .{
+                    MipSlice   = 0,
+                };
+
+            case ._2D_ARRAY;
+                ViewDimension = .TEXTURE2DARRAY;
+                Texture2DArray = .{
+                    MipSlice        = 0,
+                    FirstArraySlice = 0,
+                    ArraySize       = depth
+                };
+
+            case .CUBE; #through;
+            case ._3D;
+                assert(false, "Invalid texture view type for depth stencil target.");
+        }
+
+        return result;
     }
 
     init_command_queue :: (device: *Device, queue: *Command_Queue, type: D3D12_COMMAND_LIST_TYPE) -> bool {
